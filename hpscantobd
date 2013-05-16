@@ -1,0 +1,154 @@
+#!/usr/bin/perl
+#
+# hpscantobd -- HP MFP scanner scan-to button daemon
+#
+# (C) 2010 Hajo Noerenberg
+#
+# apt-get install hplip libwww-perl libxml-simple-perl libconfig-tiny-perl
+#
+# https://web.archive.org/web/20120814192842id_/http://rende.se/index.php?n=Main.ScanToFolder
+# https://forums.gentoo.org/viewtopic-p-8054902.html
+#
+# http://www.noerenberg.de/
+# https://github.com/hn/hpscantobd
+#
+#
+# This program is free software: you can redistribute it and/or modify
+# it under the terms of the GNU General Public License version 3.0 as
+# published by the Free Software Foundation.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along
+# with this program. If not, see <http://www.gnu.org/licenses/gpl-3.0.txt>.
+#
+
+use strict;
+use Sys::Hostname;
+use Config::Tiny;
+use LWP::UserAgent;
+use XML::Simple;
+use Data::Dumper;
+
+my $conffile = $ARGV[0] ? $ARGV[0] : "/etc/hpscantobd.conf";
+my $config = Config::Tiny->read($conffile);
+
+unless ($config) {
+    exit 1;
+}
+
+my $ip    = $config->{_}->{scanner_address};
+my $debug = $config->{_}->{debug};
+
+$ENV{HP_SCANNER_URI} = $config->{_}->{scanner_uri};
+$ENV{HP_OUTPUT_DIR}  = $config->{_}->{output_dir};
+
+my $ua     = LWP::UserAgent->new();
+my $inirun = 1;
+my $err    = 0;
+
+LOOP:
+while (1) {
+
+    print "Checking printer status (err=" . $err . ")\n" if ($debug);
+
+    sleep( $err * $err );
+
+    my $sreq = HTTP::Request->new( 'GET' => 'http://' . $ip . '/hp/device/notifications.xml' );
+    my $sres = $ua->request($sreq);
+
+    unless ( $sres->is_success ) {
+        print STDERR "Unable to read status: " . $sres->status_line . "\n";
+        $err++ if ( $err < 10 );
+        next LOOP;
+    }
+
+    my $sref = XMLin( $sres->content );
+
+    print Dumper($sref) if ( $debug > 1 );
+
+    if ( $inirun || $sref->{ScanToNotifications}->{ScanToNotSetup} ) {
+
+        $inirun = 0;
+
+        my $dreq = HTTP::Request->new( 'GET' => 'http://' . $ip . '/hp/device/info_scanto_destinations.xml' );
+        my $dres = $ua->request($dreq);
+
+        unless ( $dres->is_success ) {
+            print STDERR "Unable to read destinations: " . $dres->status_line . "\n";
+            $err++ if ( $err < 10 );
+            next LOOP;
+        }
+
+        my $dref = XMLin( $dres->content, ForceArray => ['ScanToDestination'] );
+
+        print Dumper($dref) if ( $debug > 1 );
+
+        for my $scandest ( @{ $dref->{ScanToDestinationList}->{ScanToDestination} } ) {
+
+            next if defined( $config->{ $scandest->{DeviceDisplay} }->{cmd} );
+
+            my $rreq = HTTP::Request->new( 'POST' => 'http://' . $ip . '/hp/device/set_config.html', [], "RemoveScanToDest_1=" . $scandest->{DeviceDisplay} );
+            my $rres = $ua->request($rreq);
+
+            unless ( $rres->is_success ) {
+                print STDERR "Unable to set config: " . $rres->status_line . "\n";
+                $err++ if ( $err < 10 );
+                next LOOP;
+            }
+        }
+
+      PROFILE:
+        foreach my $profile ( keys %{$config} ) {
+            next unless defined( $config->{$profile}->{cmd} );
+            for my $scandest ( @{ $dref->{ScanToDestinationList}->{ScanToDestination} } ) {
+                next PROFILE if ( $profile eq $scandest->{DeviceDisplay} );
+            }
+
+            my $areq = HTTP::Request->new( 'POST' => 'http://' . $ip . '/hp/device/set_config.html', [], "AddScanToDest_1=" . hostname . "^" . $profile . "^DestFolder" );
+            my $ares = $ua->request($areq);
+
+            unless ( $ares->is_success ) {
+                print STDERR "Unable to set config: " . $ares->status_line . "\n";
+                $err++ if ( $err < 10 );
+                next LOOP;
+            }
+        }
+
+    }
+
+    my $startscan;
+    $ENV{HP_ADF} = "";
+
+    if ( $sref->{StartScanNotifications}->{StartScan} ) {
+        $startscan = 'default';
+        $ENV{HP_ADF} = $sref->{StartScanNotifications}->{ADFLoaded} ? "--adf" : "";
+    }
+
+    if ( $sref->{ScanToNotifications}->{ScanToDeviceDisplay}
+        && ref( $sref->{ScanToNotifications}->{ScanToDeviceDisplay} ) ne 'HASH' )
+    {
+        $startscan = $sref->{ScanToNotifications}->{ScanToDeviceDisplay};
+        $ENV{HP_ADF} = $sref->{ScanToNotifications}->{ADFLoaded} ? "--adf" : "";
+    }
+
+    if ($startscan) {
+        print "Start scan to: " . $startscan . "\n";
+        if ( defined( $config->{$startscan}->{cmd} ) ) {
+            print "Executing '" . $config->{$startscan}->{cmd} . "'\n";
+            system( $config->{$startscan}->{cmd} );
+        }
+        else {
+            print STDERR "Profile '" . $startscan . "' incomplete, 'cmd' missing.\n";
+        }
+    }
+
+    $err = 0;
+
+    sleep 5;
+
+}
+
