@@ -31,6 +31,7 @@ use Sys::Hostname;
 use Config::Tiny;
 use LWP::UserAgent;
 use XML::Simple;
+use POSIX qw(strftime);
 use Data::Dumper;
 
 my $conffile = $ARGV[0] ? $ARGV[0] : "/etc/hpscantobd.conf";
@@ -90,6 +91,7 @@ while (1) {
         for my $scandest ( @{ $dref->{ScanToDestinationList}->{ScanToDestination} } ) {
 
             next if defined( $config->{ $scandest->{DeviceDisplay} }->{cmd} );
+            next if defined( $config->{ $scandest->{DeviceDisplay} }->{adf_cmd} );
 
             my $rreq = HTTP::Request->new( 'POST' => 'http://' . $ip . '/hp/device/set_config.html', [], "RemoveScanToDest_1=" . $scandest->{DeviceDisplay} );
             my $rres = $ua->request($rreq);
@@ -103,7 +105,7 @@ while (1) {
 
       PROFILE:
         foreach my $profile ( keys %{$config} ) {
-            next unless defined( $config->{$profile}->{cmd} );
+            next unless ( defined( $config->{$profile}->{cmd} ) || defined( $config->{$profile}->{adf_cmd} ) );
             for my $scandest ( @{ $dref->{ScanToDestinationList}->{ScanToDestination} } ) {
                 next PROFILE if ( $profile eq $scandest->{DeviceDisplay} );
             }
@@ -121,27 +123,40 @@ while (1) {
     }
 
     my $startscan;
-    $ENV{HP_ADF} = "";
+    my $adf_loaded = 0;
 
     if ( $sref->{StartScanNotifications}->{StartScan} ) {
         $startscan = 'default';
-        $ENV{HP_ADF} = $sref->{StartScanNotifications}->{ADFLoaded} ? "--adf" : "";
+        $adf_loaded++ if ( $sref->{StartScanNotifications}->{ADFLoaded} );
     }
 
     if ( $sref->{ScanToNotifications}->{ScanToDeviceDisplay}
         && ref( $sref->{ScanToNotifications}->{ScanToDeviceDisplay} ) ne 'HASH' )
     {
         $startscan = $sref->{ScanToNotifications}->{ScanToDeviceDisplay};
-        $ENV{HP_ADF} = $sref->{ScanToNotifications}->{ADFLoaded} ? "--adf" : "";
+        $adf_loaded++ if ( $sref->{ScanToNotifications}->{ADFLoaded} );
     }
 
     if ($startscan) {
-        print "Start scan to: " . $startscan . "\n";
-        if ( defined( $config->{$startscan}->{cmd} ) ) {
-            print "Executing '" . $config->{$startscan}->{cmd} . "'\n";
-            system( $config->{$startscan}->{cmd} );
+        print "Start scan profile: " . $startscan . " (ADF=" . $adf_loaded . ")\n";
+        $ENV{HP_OUTPUT_FILE}  = ( $config->{_}->{output_prefix} ? $config->{_}->{output_prefix} : "scan" ) . "-" . strftime("%Y%m%d-%H%M%S", localtime);
+
+        my $scan_cmd;
+        if ( $adf_loaded && defined( $config->{$startscan}->{adf_cmd} ) ) {
+            $scan_cmd = $config->{$startscan}->{adf_cmd};
+        } else {
+            $scan_cmd = $config->{$startscan}->{cmd};
         }
-        else {
+
+        if ($scan_cmd) {
+            print "Executing '" . $scan_cmd . "'\n";
+            my $success = system( $scan_cmd );
+            print "Scan cmd exited with '" . $success . "'\n";
+            if ( (!$success) && defined( $config->{$startscan}->{post_cmd} ) ) {
+                print "Executing '" . $config->{$startscan}->{post_cmd} . "'\n";
+                system( $config->{$startscan}->{post_cmd} );
+            }
+        } else {
             print STDERR "Profile '" . $startscan . "' incomplete, 'cmd' missing.\n";
         }
     }
